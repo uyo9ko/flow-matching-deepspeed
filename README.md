@@ -7,4 +7,5 @@ This project adapts and simplifies code from the [Rectified Flow (PyTorch)](http
 ## Features  
 - Minimal setup for flow-matching-based image generation.  
 - Efficient acceleration with **Accelerate** and **DeepSpeed**.  
-- Simplified code structure for ease of customization and understanding.
+- Simplified code structure for ease of customization and understanding.  
+- Trains on the [ImageNet-1k dataset](https://huggingface.co/datasets/ILSVRC/imagenet-1k).  
