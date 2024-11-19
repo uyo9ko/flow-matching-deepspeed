@@ -6,11 +6,10 @@ import torch.nn as nn
 import datasets
 import PIL
 from accelerate import Accelerator, DataLoaderConfiguration
-from einops import rearrange, repeat
-from torch.nn import MSELoss
+
 from torch.utils.data import DataLoader
 from torchdiffeq import odeint
-from torchvision.transforms import Compose, Resize, ToTensor, Normalize
+from torchvision.transforms import Compose, Resize, ToTensor, Normalize, CenterCrop
 from tqdm import tqdm
 import wandb
 from typing import *
@@ -18,108 +17,15 @@ import yaml
 import math
 
 from model import Unet
-
-
-def append_dims(t, ndims):
-    shape = t.shape
-    return t.reshape(*shape, *((1,) * ndims))
-
-def exists(v):
-    return v is not None
-
-def default(v, d):
-    return v if exists(v) else d 
-
-def cosmap(t):
-    # Algorithm 21 in https://arxiv.org/abs/2403.03206
-    return 1. - (1. / (torch.tan(torch.pi / 2 * t) + 1))
-
-class RectifiedFlow(nn.Module):
-    def __init__(self, net: nn.Module, device: torch.device) -> None:
-        super().__init__()
-        self.net = net
-        self.device = device
-        self.loss_fn = MSELoss()
-        self.noise_schedule = cosmap
-
-    def predict_flow(self, model, noised, *, times, eps = 1e-10):
-        batch = noised.shape[0]
-        # prepare maybe time conditioning for model
-        model_kwargs = dict()
-        times = rearrange(times, '... -> (...)')
-        if times.numel() == 1:
-            times = repeat(times, '1 -> b', b = batch)
-        model_kwargs.update(**{'times': times})
-        output = model(noised, **model_kwargs)
-        return output
-
-    def forward(self, data):
-        noise = torch.randn_like(data)
-        times = torch.rand(data.shape[0], device = self.device)
-        padded_times = append_dims(times, data.ndim - 1)
-
-        def get_noised_and_flows(model, t):
-            # maybe noise schedule
-
-            t = self.noise_schedule(t)
-
-            # Algorithm 2 in paper
-            # linear interpolation of noise with data using random times
-            # x1 * t + x0 * (1 - t) - so from noise (time = 0) to data (time = 1.)
-
-            noised = t * data + (1. - t) * noise
-
-            # the model predicts the flow from the noised data
-
-            flow = data - noise
-
-            pred_flow = self.predict_flow(self.net, noised, times = t)
-
-            # predicted data will be the noised xt + flow * (1. - t)
-            pred_data = noised + pred_flow * (1. - t)
-
-            return flow, pred_flow, pred_data
-
-        flow, pred_flow, pred_data = get_noised_and_flows(self.net, padded_times)
-        loss = self.loss_fn(flow, pred_flow)
-
-        return loss
-
-    @torch.no_grad()
-    def sample(
-        self,
-        batch_size = 1,
-        steps = 16,
-        noise = None,
-        data_shape: Tuple[int, ...] | None = None,
-        **kwargs
-    ):
-        self.eval()
-
-        def ode_fn(t, x):
-            flow = self.predict_flow(self.net, x, times = t)
-            return flow
-
-        # start with random gaussian noise - y0
-        noise = default(noise, torch.randn((batch_size, *data_shape), device = self.device))
-
-        # time steps
-        times = torch.linspace(0., 1., steps, device = self.device)
-
-        # ode
-        trajectory = odeint(ode_fn, noise, times, atol = 1e-5, rtol = 1e-5, method = 'midpoint')
-
-        sampled_data = trajectory[-1]
-
-        self.train()
-
-        return sampled_data
-
-
+from flows.optimal_transport_flow import OptimalTransportFlow
 
 def collate_fn(batch, image_size=(256, 256)):
+    if not isinstance(image_size, (list, tuple)):
+        image_size = (image_size, image_size)
+        
     transform = Compose([
-        Resize(image_size),  # Now using the passed image_size parameter
+        Resize(image_size[0], antialias=True),  # Resize shortest edge while maintaining aspect ratio
+        CenterCrop(image_size),  # Crop to desired size from center
         ToTensor(),          
         Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
     ])
@@ -176,11 +82,12 @@ def training_function(config, args):
 
     # Instantiate the model (we build the model here so that the seed also control new weights initialization)
     net = Unet(dim=model_dim)
+    param_count = sum(p.numel() for p in net.parameters())
     # We could avoid this line since the accelerator is set with `device_placement=True` (default value).
     # Note that if you are placing tensors on devices manually, this line absolutely needs to be before the optimizer
     # creation otherwise training will not work on TPU (`accelerate` will kindly throw an error to make us aware of that).
     net = net.to(accelerator.device)
-    flow_model = RectifiedFlow(net, accelerator.device)
+    flow_model = OptimalTransportFlow(net, accelerator.device)
 
     # Instantiate optimizer
     optimizer = torch.optim.Adam(params=flow_model.parameters(), lr=lr) 
@@ -209,6 +116,7 @@ def training_function(config, args):
 
     if accelerator.is_main_process: 
         print("***** Running training *****")
+        print(f"  Number of model parameters: {param_count:,} ({param_count/1e6:.2f}M)")
         print(f"  Num batches each epoch = {data_set_len // batch_size}")
         print(f"  Num Epochs = {num_train_epochs}")
         print(f"  Instantaneous batch size per device = {batch_size}")
@@ -277,6 +185,7 @@ def training_function(config, args):
                         output_dir = f"step_{overall_step}"
                         if args.ckpt_dir is not None:
                             output_dir = os.path.join(args.ckpt_dir, output_dir)
+                        os.makedirs(output_dir, exist_ok=True)
                         accelerator.save_state(output_dir)
 
             logs = {"loss": loss.detach().item()}
@@ -369,13 +278,13 @@ def main():
     config = {"lr": 1e-4,
               "num_epochs": 5,
               "seed": 42,
-              "batch_size": 32,
+              "batch_size": 24,
               "gradient_accumulation_steps": 1,
               "num_workers": 4,
               "pin_memory": True,
               "image_size": 256,
               "model_dim": 64,
-              "max_train_steps": 200000
+              "max_train_steps": 100000
               }
     training_function(config, args)
 
