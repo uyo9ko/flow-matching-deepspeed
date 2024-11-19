@@ -137,14 +137,9 @@ def training_function(config, args):
             path = dirs[-1]  # Sorts folders by date modified, most recent checkpoint is the last
         # Extract `epoch_{i}` or `step_{i}`
         training_difference = os.path.splitext(path)[0]
-
-        if "epoch" in training_difference:
-            starting_epoch = int(training_difference.replace("epoch_", "")) + 1
-            resume_step = None
-        else:
-            resume_step = int(training_difference.replace("step_", ""))
-            starting_epoch = resume_step // len(dataloader)
-            resume_step -= starting_epoch * len(dataloader)
+        resume_step = int(training_difference.replace("step_", ""))
+        starting_epoch = resume_step // data_set_len
+        resume_step -= starting_epoch * data_set_len
 
     # Now we train the model
     progress_bar = tqdm(
@@ -158,13 +153,9 @@ def training_function(config, args):
     for epoch in range(starting_epoch, num_epochs):
         flow_model.train()
         if args.resume_from_checkpoint and epoch == starting_epoch and resume_step is not None:
-            # We need to skip steps until we reach the resumed step
-            active_dataloader = accelerator.skip_first_batches(dataloader, resume_step)
             overall_step += resume_step
-        else:
-            # After the first iteration though, we need to go back to the original dataloader
-            active_dataloader = dataloader
-
+            progress_bar.update(resume_step)
+        active_dataloader = dataloader
         # start training
         for batch in active_dataloader:
             with accelerator.accumulate(flow_model):
@@ -283,7 +274,7 @@ def main():
               "num_workers": 4,
               "pin_memory": True,
               "image_size": 256,
-              "model_dim": 64,
+              "model_dim": 128,
               "max_train_steps": 100000
               }
     training_function(config, args)

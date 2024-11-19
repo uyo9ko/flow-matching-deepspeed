@@ -30,8 +30,6 @@ class OptimalTransportFlow(nn.Module):
         self.sig_min = sig_min
         self.loss_fn = MSELoss()
         self.noise_schedule = cosmap
-        self.clip_values = (-1., 1.)
-        self.clip_flow_values = (-3., 3.)
 
     def predict_flow(self, model, noised, *, times):
         batch = noised.shape[0]
@@ -89,12 +87,8 @@ class OptimalTransportFlow(nn.Module):
     ):
         self.eval()
 
-        maybe_clip = (lambda t: t.clamp_(*self.clip_values)) 
-        maybe_clip_flow = (lambda t: t.clamp_(*self.clip_flow_values)) 
         def ode_fn(t, x):
-            x = maybe_clip(x)
             flow = self.predict_flow(self.net, x, times = t)
-            flow = maybe_clip_flow(flow)
             return flow
 
         # start with random gaussian noise - y0
