@@ -17,7 +17,7 @@ import yaml
 import math
 
 from model import Unet
-from flows.optimal_transport_flow import OptimalTransportFlow
+from flows.vp_diffusion_flow import VPDiffusionFlowMatching
 
 def collate_fn(batch, image_size=(256, 256)):
     if not isinstance(image_size, (list, tuple)):
@@ -87,7 +87,7 @@ def training_function(config, args):
     # Note that if you are placing tensors on devices manually, this line absolutely needs to be before the optimizer
     # creation otherwise training will not work on TPU (`accelerate` will kindly throw an error to make us aware of that).
     net = net.to(accelerator.device)
-    flow_model = OptimalTransportFlow(net, accelerator.device)
+    flow_model = VPDiffusionFlowMatching(net, accelerator.device)
 
     # Instantiate optimizer
     optimizer = torch.optim.Adam(params=flow_model.parameters(), lr=lr) 
