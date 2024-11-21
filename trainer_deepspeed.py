@@ -7,6 +7,7 @@ import datasets
 import PIL
 from accelerate import Accelerator, DataLoaderConfiguration
 
+from classes import IMAGENET2012_CLASSES
 from torch.utils.data import DataLoader
 from torchdiffeq import odeint
 from torchvision.transforms import Compose, Resize, ToTensor, Normalize, CenterCrop
@@ -16,8 +17,8 @@ from typing import *
 import yaml
 import math
 
-from model import Unet
-from flows.vp_diffusion_flow import VPDiffusionFlowMatching
+from networks.unet import Unet
+from flows.rectified_flow import RectifiedFlow
 
 def collate_fn(batch, image_size=(256, 256)):
     if not isinstance(image_size, (list, tuple)):
@@ -31,7 +32,12 @@ def collate_fn(batch, image_size=(256, 256)):
     ])
     
     images = [transform(item['jpeg'].convert('RGB')) for item in batch]
-    return torch.stack(images)
+    labels = [item['__key__'].split('_')[0] for item in batch  ]
+    label_indices = [list(IMAGENET2012_CLASSES.keys()).index(label) for label in labels]
+    return {
+        'images': torch.stack(images),
+        'labels': torch.tensor(label_indices)
+    }
 
 
 def training_function(config, args):
@@ -81,13 +87,14 @@ def training_function(config, args):
     )
 
     # Instantiate the model (we build the model here so that the seed also control new weights initialization)
-    net = Unet(dim=model_dim)
+    net = Unet(dim = model_dim, num_class=1000)
+
     param_count = sum(p.numel() for p in net.parameters())
     # We could avoid this line since the accelerator is set with `device_placement=True` (default value).
     # Note that if you are placing tensors on devices manually, this line absolutely needs to be before the optimizer
     # creation otherwise training will not work on TPU (`accelerate` will kindly throw an error to make us aware of that).
     net = net.to(accelerator.device)
-    flow_model = VPDiffusionFlowMatching(net, accelerator.device)
+    flow_model = RectifiedFlow(net, accelerator.device)
 
     # Instantiate optimizer
     optimizer = torch.optim.Adam(params=flow_model.parameters(), lr=lr) 
@@ -160,9 +167,9 @@ def training_function(config, args):
         for batch in active_dataloader:
             with accelerator.accumulate(flow_model):
                 # We could avoid this line since we set the accelerator with `device_placement=True`.
-                # batch = {k: v.to(accelerator.device) for k, v in batch.items()}
-                batch = batch.to(accelerator.device)
-                loss = flow_model(batch)
+                batch = {k: v.to(accelerator.device) for k, v in batch.items()}
+                # batch = batch.to(accelerator.device)
+                loss = flow_model(batch['images'], batch['labels'])
                 accelerator.backward(loss)
                 optimizer.step()
                 optimizer.zero_grad()
@@ -190,7 +197,8 @@ def training_function(config, args):
                 if overall_step % sampling_steps == 0:
                     flow_model.eval()
                     # Generate samples
-                    samples = accelerator.unwrap_model(flow_model).sample(batch_size=4, data_shape=batch.shape[1:])
+                    labels = torch.randint(0, 1000, (4,)).to(accelerator.device)
+                    samples = accelerator.unwrap_model(flow_model).sample(labels, batch_size=4, data_shape=batch['images'].shape[1:])
                     
                     # Convert and save each sample
                     images = []
@@ -267,13 +275,13 @@ def main():
     )
     args = parser.parse_args()
     config = {"lr": 1e-4,
-              "num_epochs": 5,
+              "num_epochs": 10,
               "seed": 42,
-              "batch_size": 24,
+              "batch_size": 32,
               "gradient_accumulation_steps": 1,
               "num_workers": 4,
               "pin_memory": True,
-              "image_size": 256,
+              "image_size": 128,
               "model_dim": 128,
               "max_train_steps": 100000
               }

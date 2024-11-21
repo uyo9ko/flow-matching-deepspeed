@@ -661,6 +661,7 @@ class Unet(Module):
     def __init__(
         self,
         dim,
+        num_class = None,
         init_dim = None,
         out_dim = None,
         dim_mults: Tuple[int, ...] = (1, 2, 4, 8),
@@ -707,7 +708,8 @@ class Unet(Module):
             nn.GELU(),
             nn.Linear(time_dim, time_dim)
         )
-
+        if num_class is not None:
+            self.label_emb = nn.Embedding(num_class, time_dim)
         # attention
 
         if not full_attn:
@@ -770,13 +772,16 @@ class Unet(Module):
     def downsample_factor(self):
         return 2 ** (len(self.downs) - 1)
 
-    def forward(self, x, times):
+    def forward(self, x, times, y = None):
         assert all([divisible_by(d, self.downsample_factor) for d in x.shape[-2:]]), f'your input dimensions {x.shape[-2:]} need to be divisible by {self.downsample_factor}, given the unet'
 
         x = self.init_conv(x)
         r = x.clone()
 
         t = self.time_mlp(times)
+
+        if y is not None:
+            t = t + self.label_emb(y)
 
         h = []
 
