@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import datasets
 import PIL
+from einops import rearrange
 from accelerate import Accelerator, DataLoaderConfiguration
 
 from classes import IMAGENET2012_CLASSES
@@ -18,6 +19,7 @@ import yaml
 import math
 
 from networks.unet import Unet
+from networks.flux_ae import ae_transform, load_ae
 from flows.rectified_flow import RectifiedFlow
 
 def collate_fn(batch, image_size=(256, 256)):
@@ -27,11 +29,10 @@ def collate_fn(batch, image_size=(256, 256)):
     transform = Compose([
         Resize(image_size[0], antialias=True),  # Resize shortest edge while maintaining aspect ratio
         CenterCrop(image_size),  # Crop to desired size from center
-        ToTensor(),          
-        Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
     ])
     
     images = [transform(item['jpeg'].convert('RGB')) for item in batch]
+    images = [ae_transform(img) for img in images]
     labels = [item['__key__'].split('_')[0] for item in batch  ]
     label_indices = [list(IMAGENET2012_CLASSES.keys()).index(label) for label in labels]
     return {
@@ -87,7 +88,11 @@ def training_function(config, args):
     )
 
     # Instantiate the model (we build the model here so that the seed also control new weights initialization)
-    net = Unet(dim = model_dim, num_class=1000)
+    net = Unet(channels = 16, dim = model_dim, num_class=1000)
+
+    ae_ckpt_path = '/data_training/larry/code/dit/flow-matching-deepspeed/ae_weights/ae.safetensors'
+    ae = load_ae(device=accelerator.device, ckpt_path=ae_ckpt_path)
+    ae.requires_grad_(False)
 
     param_count = sum(p.numel() for p in net.parameters())
     # We could avoid this line since the accelerator is set with `device_placement=True` (default value).
@@ -107,6 +112,13 @@ def training_function(config, args):
     flow_model, optimizer, dataloader = accelerator.prepare(
         flow_model, optimizer, dataloader     
     )
+
+
+    weight_dtype = torch.float32
+    if accelerator.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+    elif accelerator.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
 
     data_set_len = 1_281_167
     # We need to keep track of how many total steps we have iterated over
@@ -168,8 +180,13 @@ def training_function(config, args):
             with accelerator.accumulate(flow_model):
                 # We could avoid this line since we set the accelerator with `device_placement=True`.
                 batch = {k: v.to(accelerator.device) for k, v in batch.items()}
+                images = batch['images']
+                labels = batch['labels']
                 # batch = batch.to(accelerator.device)
-                loss = flow_model(batch['images'], batch['labels'])
+                with torch.no_grad():
+                    latents = ae.encode(images.to(torch.float32))
+                latents = latents.to(weight_dtype)
+                loss = flow_model(latents, labels)
                 accelerator.backward(loss)
                 optimizer.step()
                 optimizer.zero_grad()
@@ -198,15 +215,19 @@ def training_function(config, args):
                     flow_model.eval()
                     # Generate samples
                     labels = torch.randint(0, 1000, (4,)).to(accelerator.device)
-                    samples = accelerator.unwrap_model(flow_model).sample(labels, batch_size=4, data_shape=batch['images'].shape[1:])
+                    samples = accelerator.unwrap_model(flow_model).sample(labels, batch_size=4, data_shape=latents.shape[1:])
+                    with torch.no_grad():
+                        samples = ae.decode(samples)
                     
                     # Convert and save each sample
                     images = []
                     for i, sample in enumerate(samples):
                         # Denormalize and convert to PIL image
-                        sample = (sample.cpu().clamp(-1, 1) + 1) / 2 * 255
-                        sample = sample.permute(1, 2, 0).numpy().astype(np.uint8)
-                        img = PIL.Image.fromarray(sample)
+                        # sample = (sample.cpu().clamp(-1, 1) + 1) / 2 * 255
+                        # sample = sample.permute(1, 2, 0).numpy().astype(np.uint8)
+                        sample = sample.clamp(-1, 1)
+                        sample = rearrange(sample, "c h w -> h w c")
+                        img = PIL.Image.fromarray((127.5 * (sample + 1.0)).cpu().byte().numpy())
                         images.append(img)
                         
                     # Log the image if tracking is enabled
@@ -277,11 +298,11 @@ def main():
     config = {"lr": 1e-4,
               "num_epochs": 10,
               "seed": 42,
-              "batch_size": 32,
+              "batch_size": 64,
               "gradient_accumulation_steps": 1,
               "num_workers": 4,
               "pin_memory": True,
-              "image_size": 128,
+              "image_size": 256,
               "model_dim": 128,
               "max_train_steps": 100000
               }
