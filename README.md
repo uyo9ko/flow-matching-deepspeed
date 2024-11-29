@@ -11,8 +11,8 @@ This project adapts and simplifies code from the [Rectified Flow (PyTorch)](http
 - Trains on the [ImageNet-1k dataset](https://huggingface.co/datasets/ILSVRC/imagenet-1k).  
 
 ## TODO  
-- [x] Add **VP flow-matching** support for enhanced capabilities.  
-- [ ] Add **VE flow-matching** support for enhanced capabilities.  
 - [x] Implement conditional flow-matching based on class labels.
 - [x] Add image VAE encoding.
-- [ ] Add dit models.
+- [x] Add sit model.
+- [ ] Add efficietn dit archtecture (sana).
+- [ ] Change different optimizers like [Shampoo](https://github.com/facebookresearch/optimizers)
