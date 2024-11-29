@@ -22,27 +22,29 @@ def cosmap(t):
     # Algorithm 21 in https://arxiv.org/abs/2403.03206
     return 1. - (1. / (torch.tan(torch.pi / 2 * t) + 1))
 
-class OptimalTransportFlow(nn.Module):
-    def __init__(self, net: nn.Module, device: torch.device, sig_min: float = 0.001) -> None:
+class RectifiedFlow(nn.Module):
+    def __init__(self, net: nn.Module, device: torch.device) -> None:
         super().__init__()
         self.net = net
         self.device = device
-        self.sig_min = sig_min
         self.loss_fn = MSELoss()
         self.noise_schedule = cosmap
 
-    def predict_flow(self, model, noised, *, times):
+    def predict_flow(self, model, noised, *, times, y, cfg_scale = None, eps = 1e-10):
         batch = noised.shape[0]
         # prepare maybe time conditioning for model
         model_kwargs = dict()
         times = rearrange(times, '... -> (...)')
         if times.numel() == 1:
             times = repeat(times, '1 -> b', b = batch)
-        model_kwargs.update(**{'times': times})
-        output = model(noised, **model_kwargs)
+        model_kwargs.update(**{'t': times, 'y': y})
+        if cfg_scale is not None:
+            output = model.forward_with_cfg(noised, **model_kwargs, cfg_scale = cfg_scale)
+        else:
+            output = model.forward(noised, **model_kwargs)
         return output
 
-    def forward(self, data):
+    def forward(self, data, labels):
         noise = torch.randn_like(data)
         times = torch.rand(data.shape[0], device = self.device)
         padded_times = append_dims(times, data.ndim - 1)
@@ -56,22 +58,20 @@ class OptimalTransportFlow(nn.Module):
             # linear interpolation of noise with data using random times
             # x1 * t + x0 * (1 - t) - so from noise (time = 0) to data (time = 1.)
 
-            # noised = t * data + (1. - t) * noise
-            noised = t * data + (1 - (1 - self.sig_min) * t) * noise
+            noised = t * data + (1. - t) * noise
 
             # the model predicts the flow from the noised data
 
-            # flow = data - noise
-            flow = data - (1 - self.sig_min) * noise
+            flow = data - noise
 
-            pred_flow = self.predict_flow(self.net, noised, times = t)
+            pred_flow = self.predict_flow(self.net, noised, times = t, y = labels)
 
             # predicted data will be the noised xt + flow * (1. - t)
             pred_data = noised + pred_flow * (1. - t)
 
             return flow, pred_flow, pred_data
 
-        flow, pred_flow, pred_data = get_noised_and_flows(padded_times)
+        flow, pred_flow, pred_data = get_noised_and_flows( padded_times)
         loss = self.loss_fn(flow, pred_flow)
 
         return loss
@@ -79,21 +79,19 @@ class OptimalTransportFlow(nn.Module):
     @torch.no_grad()
     def sample(
         self,
-        batch_size = 1,
-        steps = 16,
-        noise = None,
-        data_shape: Tuple[int, ...] | None = None,
+        noise,
+        labels,
+        steps = 25,
+        cfg_scale = None,
         **kwargs
     ):
         self.eval()
 
         def ode_fn(t, x):
-            flow = self.predict_flow(self.net, x, times = t)
+            flow = self.predict_flow(self.net, x, times = t, y = labels, cfg_scale = cfg_scale)
             return flow
 
         # start with random gaussian noise - y0
-        noise = default(noise, torch.randn((batch_size, *data_shape), device = self.device))
-
         # time steps
         times = torch.linspace(0., 1., steps, device = self.device)
 

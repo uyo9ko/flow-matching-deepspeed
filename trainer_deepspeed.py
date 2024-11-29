@@ -16,19 +16,43 @@ from tqdm import tqdm
 import wandb
 from typing import *
 import yaml
+import torchvision.transforms as transforms
+from PIL import Image
 import math
 
-from networks.unet import Unet
-from networks.flux_ae import ae_transform, load_ae
-from flows.rectified_flow import RectifiedFlow
+from networks.sit import SiT_models
+from networks.flux_modules.autoencoder import ae_transform, load_ae
+
+from flow_matching import RectifiedFlow
+
+
+def center_crop_arr(pil_image, image_size):
+    """
+    Center cropping implementation from ADM.
+    https://github.com/openai/guided-diffusion/blob/8fb3ad9197f16bbc40620447b2742e13458d2831/guided_diffusion/image_datasets.py#L126
+    """
+    while min(*pil_image.size) >= 2 * image_size:
+        pil_image = pil_image.resize(
+            tuple(x // 2 for x in pil_image.size), resample=Image.BOX
+        )
+
+    scale = image_size / min(*pil_image.size)
+    pil_image = pil_image.resize(
+        tuple(round(x * scale) for x in pil_image.size), resample=Image.BICUBIC
+    )
+
+    arr = np.array(pil_image)
+    crop_y = (arr.shape[0] - image_size) // 2
+    crop_x = (arr.shape[1] - image_size) // 2
+    return Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
 
 def collate_fn(batch, image_size=(256, 256)):
     if not isinstance(image_size, (list, tuple)):
         image_size = (image_size, image_size)
         
     transform = Compose([
-        Resize(image_size[0], antialias=True),  # Resize shortest edge while maintaining aspect ratio
-        CenterCrop(image_size),  # Crop to desired size from center
+        transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, image_size[0])),
+        transforms.RandomHorizontalFlip(),
     ])
     
     images = [transform(item['jpeg'].convert('RGB')) for item in batch]
@@ -59,7 +83,6 @@ def training_function(config, args):
     seed = int(config["seed"])
     batch_size = int(config["batch_size"])
     image_size = config["image_size"]
-    model_dim = config["model_dim"]
     max_train_steps = config["max_train_steps"]
     if not isinstance(image_size, (list, tuple)):
         image_size = (image_size, image_size)
@@ -88,7 +111,8 @@ def training_function(config, args):
     )
 
     # Instantiate the model (we build the model here so that the seed also control new weights initialization)
-    net = Unet(channels = 16, dim = model_dim, num_class=1000)
+    model_class = SiT_models['SiT-B/4']
+    net = model_class()  
 
     ae_ckpt_path = '/data_training/larry/code/dit/flow-matching-deepspeed/ae_weights/ae.safetensors'
     ae = load_ae(device=accelerator.device, ckpt_path=ae_ckpt_path)
@@ -102,7 +126,7 @@ def training_function(config, args):
     flow_model = RectifiedFlow(net, accelerator.device)
 
     # Instantiate optimizer
-    optimizer = torch.optim.Adam(params=flow_model.parameters(), lr=lr) 
+    optimizer = torch.optim.AdamW(params=flow_model.parameters(), lr=lr, weight_decay=0)
     # Instantiate learning rate scheduler
     lr_scheduler = None
 
@@ -122,6 +146,7 @@ def training_function(config, args):
 
     data_set_len = 1_281_167
     # We need to keep track of how many total steps we have iterated over
+    resume_step = 0
     overall_step = 0
     # We also need to keep track of the starting epoch so files are named properly
     starting_epoch = 0
@@ -171,7 +196,7 @@ def training_function(config, args):
 
     for epoch in range(starting_epoch, num_epochs):
         flow_model.train()
-        if args.resume_from_checkpoint and epoch == starting_epoch and resume_step is not None:
+        if args.resume_from_checkpoint and epoch == starting_epoch and resume_step > 0:
             overall_step += resume_step
             progress_bar.update(resume_step)
         active_dataloader = dataloader
@@ -211,11 +236,20 @@ def training_function(config, args):
                 break
 
             if accelerator.is_main_process:
-                if overall_step % sampling_steps == 0:
+                if overall_step % sampling_steps == 0 or overall_step-resume_step == 1:
                     flow_model.eval()
                     # Generate samples
+                    noise = torch.randn(4, 16, 32, 32, device=accelerator.device)
                     labels = torch.randint(0, 1000, (4,)).to(accelerator.device)
-                    samples = accelerator.unwrap_model(flow_model).sample(labels, batch_size=4, data_shape=latents.shape[1:])
+
+                    # using cfg
+                    cfg_scale = 1.5
+                    noise = torch.cat([noise, noise], 0)
+                    labels = torch.cat([labels, torch.tensor([1000] * 4, device=accelerator.device)], 0)
+
+                    samples = accelerator.unwrap_model(flow_model).sample(noise, labels, cfg_scale=cfg_scale)
+                    samples, _ = samples.chunk(2, dim=0)
+                    
                     with torch.no_grad():
                         samples = ae.decode(samples)
                     
@@ -296,15 +330,14 @@ def main():
     )
     args = parser.parse_args()
     config = {"lr": 1e-4,
-              "num_epochs": 10,
+              "num_epochs": 20,
               "seed": 42,
               "batch_size": 64,
               "gradient_accumulation_steps": 1,
               "num_workers": 4,
               "pin_memory": True,
               "image_size": 256,
-              "model_dim": 128,
-              "max_train_steps": 100000
+              "max_train_steps": 1000000
               }
     training_function(config, args)
 
