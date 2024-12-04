@@ -1,4 +1,4 @@
-# Flow-Matching with DeepSpeed  
+# Image generation trainer
 A streamlined implementation of a flow-matching image generation task, powered by **Accelerate**.
 
 ## Overview  
